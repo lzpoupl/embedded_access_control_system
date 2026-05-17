@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use libc::input_event;
 
+mod db;
+
 const EV_KEY: u16 = 0x01; // 手动定义 EV_KEY
 
 fn main() -> io::Result<()> {
