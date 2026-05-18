@@ -30,11 +30,21 @@ pub struct UserTableInfo {
     department: String,
     is_active: i32,
 }
+// 新建该结构体对象可以使用如下方法：
+impl UserTableInfo {
+    pub fn new(name: String, nfc_uid: String, phone: String, department: String, is_active: i32) -> Self;
+}
 pub fn register_user(user_info: UserTableInfo) -> Result<()>;
 pub fn register_users(user_infos: Vec<UserTableInfo>) -> Result<()>;
 ```
 
 请注意，如果希望批量插入user信息，请务必使用```register_users```方法，该方法内采用rusqlite中的提交控制确保不会频繁对磁盘进行IO操作。
+
+注：在这两个方法的逻辑中，如果绑定了相同的```nfc_uid```则不会覆盖，希望重新绑定nfc的话请使用这个方法：
+
+```rust
+pub fn bind_new_nfc(user_id: i32, new_nfc_uid: &str) -> Result<()>;
+```
 
 ### 3  解锁判断
 
@@ -56,5 +66,3 @@ pub fn apply_temp_code(user_id: i32, valid_duration: chrono::Duration) -> Result
 ```
 
 本方法传入的参数分别为user_id与临时码失效的时间长度；与上面两个方法相同，成功执行时返回```Ok(temp_code)```，为一个随机的9位数字临时码。
-
-
