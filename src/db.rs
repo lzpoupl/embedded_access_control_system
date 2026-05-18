@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result, params};
 use std::sync::{Mutex, OnceLock};
+use chrono::{Duration, Local};
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
@@ -11,13 +12,11 @@ pub struct UserTableInfo {
     is_active: i32,
 }
 
-pub fn init_db(db_path: &str) -> Result<()> {
+pub fn init_db(db_path: Option<&str>) -> Result<()> {
     // 如果是debug模式，直接使用内存数据库做简单测试
-    let db_conn = if cfg!(debug_assertions) {
-        Connection::open_in_memory()?
-    } else {
-        Connection::open(db_path)?
-    };
+    let db_conn = 
+        Connection::open(db_path.unwrap_or("./access_control.db"))?;
+    
     db_conn.execute("PRAGMA foreign_keys = ON", [])?;
     // 创建users表
     db_conn.execute("
@@ -135,4 +134,44 @@ pub fn unlock_nfc(nfc_uid: &str) -> Result<bool> {
         (user_id, success),
     )?;
     return_value
+}
+pub fn unlock_temp_code(temp_code: &str) -> Result<bool> {
+    let db_conn = get_db();
+    let result = db_conn.query_row("
+        SELECT user_id FROM temp_codes WHERE code = ?1 AND expires_at > datetime('now','localtime') LIMIT 1", 
+    [temp_code], 
+        |row| row.get::<_, i32>(0),
+    );
+    let (user_id, success, return_value) =  match result {
+        Ok(id) => (Some(id), 1, Ok(true)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => (None, 0, Ok(false)),
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    db_conn.execute("
+        INSERT INTO entry_logs (user_id, auth_method, success)
+        VALUES (?1, 'temp_code', ?2)", 
+        (user_id, success),
+    )?;
+    return_value
+}
+
+// 申请temp_code
+pub fn apply_temp_code(user_id: i32, valid_duration: Duration) -> Result<String> {
+    let db_conn = get_db();
+    let now = Local::now();
+    let expires_at = now + valid_duration;
+    let temp_code = format!("{:9}", rand::random::<u32>() % 1_000_000_000); // 生成9位随机码
+    db_conn.execute("
+        INSERT INTO temp_codes (user_id, code, expires_at)
+        VALUES (?1, ?2, ?3)", 
+        params![
+            user_id,
+            temp_code,
+            expires_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ]
+    )?;
+    Ok(temp_code)
 }
