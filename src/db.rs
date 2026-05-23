@@ -1,7 +1,5 @@
 use rusqlite::{Connection, Result, params};
-use std::sync::{Mutex, OnceLock};
 use chrono::{Duration, Local};
-static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
 pub struct UserTableInfo {
     name: String,
@@ -22,10 +20,7 @@ impl UserTableInfo {
     }
 }
 
-pub fn init_db(db_path: Option<&str>) -> Result<()> {
-    if DB.get().is_some() {
-        return Ok(()); // 已经初始化过了，直接返回
-    }
+pub fn init_db(db_path: Option<&str>) -> Result<Connection> {
     // 如果是debug模式，直接使用内存数据库做简单测试
     let db_conn = 
         Connection::open(db_path.unwrap_or("./access_control.db"))?;
@@ -77,29 +72,18 @@ pub fn init_db(db_path: Option<&str>) -> Result<()> {
         )", 
         [],
     )?;
-    // 设置全局变量DB
-    DB.set(Mutex::new(db_conn))
-        .map_err(|_| rusqlite::Error::InvalidParameterName("数据库已初始化".into()))?;
-    Ok(())
+    Ok(db_conn)
 }
 
-fn get_db() -> std::sync::MutexGuard<'static, Connection> {
-    DB.get()
-        .expect("数据库未初始化，请先调用 init_db()")
-        .lock()
-        .expect("数据库锁被污染")
-}
 
-pub fn bind_new_nfc(user_id: i32, new_nfc_uid: &str) -> Result<()> {
-    let db_conn = get_db();
+pub fn bind_new_nfc(db_conn: &Connection, user_id: i32, new_nfc_uid: &str) -> Result<()> {
     db_conn.execute("
         UPDATE users SET nfc_uid = ?1 WHERE id = ?2", 
         params![new_nfc_uid, user_id],
     )?;
     Ok(())
 }
-pub fn register_user(user_info: UserTableInfo) -> Result<()> {
-    let db_conn = get_db();
+pub fn register_user(db_conn: &Connection, user_info: UserTableInfo) -> Result<()> {
     db_conn.execute("
         INSERT OR IGNORE INTO users (name, nfc_uid, phone, department, is_active)
         VALUES (?1, ?2, ?3, ?4, ?5)", 
@@ -113,8 +97,7 @@ pub fn register_user(user_info: UserTableInfo) -> Result<()> {
     )?;
     Ok(())
 }
-pub fn register_users(user_infos: Vec<UserTableInfo>) -> Result<()> {
-    let mut db_conn = get_db();
+pub fn register_users(db_conn: &mut Connection, user_infos: Vec<UserTableInfo>) -> Result<()> {
     let tx = db_conn.transaction()?;
     let mut stmt = tx.prepare("
         INSERT OR IGNORE INTO users (name, nfc_uid, phone, department, is_active)
@@ -134,8 +117,7 @@ pub fn register_users(user_infos: Vec<UserTableInfo>) -> Result<()> {
     Ok(())
 }
 // 刷卡解锁
-pub fn unlock_nfc(nfc_uid: &str) -> Result<bool> {
-    let db_conn = get_db();
+pub fn unlock_nfc(db_conn: &Connection, nfc_uid: &str) -> Result<bool> {
     let result = db_conn.query_row("
         SELECT id FROM users WHERE nfc_uid = ?1 LIMIT 1", 
     [nfc_uid], 
@@ -156,8 +138,7 @@ pub fn unlock_nfc(nfc_uid: &str) -> Result<bool> {
     )?;
     return_value
 }
-pub fn unlock_temp_code(temp_code: &str) -> Result<bool> {
-    let db_conn = get_db();
+pub fn unlock_temp_code(db_conn: &Connection, temp_code: &str) -> Result<bool> {
     let result = db_conn.query_row("
         SELECT user_id FROM temp_codes WHERE code = ?1 AND expires_at > datetime('now','localtime') LIMIT 1", 
     [temp_code], 
@@ -180,8 +161,7 @@ pub fn unlock_temp_code(temp_code: &str) -> Result<bool> {
 }
 
 // 申请temp_code
-pub fn apply_temp_code(user_id: i32, valid_duration: Duration) -> Result<String> {
-    let db_conn = get_db();
+pub fn apply_temp_code(db_conn: &Connection, user_id: i32, valid_duration: Duration) -> Result<String> {
     let now = Local::now();
     let expires_at = now + valid_duration;
     let temp_code = format!("{:9}", rand::random::<u32>() % 1_000_000_000); // 生成9位随机码
@@ -195,6 +175,186 @@ pub fn apply_temp_code(user_id: i32, valid_duration: Duration) -> Result<String>
         ]
     )?;
     Ok(temp_code)
+}
+
+pub struct UserRow {
+    pub id: i32,
+    pub name: String,
+    pub nfc_uid: Option<String>,
+    pub phone: Option<String>,
+    pub department: Option<String>,
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct UserUpdate {
+    pub name: Option<String>,
+    pub nfc_uid: Option<String>,
+    pub phone: Option<String>,
+    pub department: Option<String>,
+    pub is_active: Option<bool>,
+}
+
+pub struct EntryLogRow {
+    pub id: i32,
+    pub user_id: Option<i32>,
+    pub auth_method: String,
+    pub success: bool,
+    pub timestamp: String,
+}
+
+fn map_row_to_user(row: &rusqlite::Row) -> rusqlite::Result<UserRow> {
+    Ok(UserRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        nfc_uid: row.get(2)?,
+        phone: row.get(3)?,
+        department: row.get(4)?,
+        is_active: row.get::<_, i32>(5)? != 0,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+pub fn list_users(db_conn: &Connection, search: Option<&str>) -> Result<Vec<UserRow>> {
+    if let Some(keyword) = search {
+        let pattern = format!("%{}%", keyword);
+        let mut stmt = db_conn.prepare(
+            "SELECT id, name, nfc_uid, phone, department, is_active, created_at, updated_at \
+             FROM users WHERE name LIKE ?1 OR nfc_uid LIKE ?1 OR phone LIKE ?1 OR department LIKE ?1 \
+             ORDER BY id DESC"
+        )?;
+        let rows = stmt.query_map(params![pattern], map_row_to_user)?
+            .collect::<rusqlite::Result<Vec<UserRow>>>()?;
+        Ok(rows)
+    } else {
+        let mut stmt = db_conn.prepare(
+            "SELECT id, name, nfc_uid, phone, department, is_active, created_at, updated_at \
+             FROM users ORDER BY id DESC"
+        )?;
+        let rows = stmt.query_map([], map_row_to_user)?
+            .collect::<rusqlite::Result<Vec<UserRow>>>()?;
+        Ok(rows)
+    }
+}
+
+pub fn get_user_by_id(db_conn: &Connection, id: i32) -> Result<Option<UserRow>> {
+    let mut stmt = db_conn.prepare(
+        "SELECT id, name, nfc_uid, phone, department, is_active, created_at, updated_at \
+         FROM users WHERE id = ?1"
+    )?;
+    let mut rows = stmt.query_map(params![id], map_row_to_user)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+pub fn update_user(db_conn: &Connection, id: i32, updates: &UserUpdate) -> Result<bool> {
+    let mut set_clauses: Vec<String> = Vec::new();
+    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(ref name) = updates.name {
+        set_clauses.push(format!("name = ?{}", values.len() + 1));
+        values.push(Box::new(name.clone()));
+    }
+    if let Some(ref nfc_uid) = updates.nfc_uid {
+        set_clauses.push(format!("nfc_uid = ?{}", values.len() + 1));
+        values.push(Box::new(nfc_uid.clone()));
+    }
+    if let Some(ref phone) = updates.phone {
+        set_clauses.push(format!("phone = ?{}", values.len() + 1));
+        values.push(Box::new(phone.clone()));
+    }
+    if let Some(ref department) = updates.department {
+        set_clauses.push(format!("department = ?{}", values.len() + 1));
+        values.push(Box::new(department.clone()));
+    }
+    if let Some(is_active) = updates.is_active {
+        set_clauses.push(format!("is_active = ?{}", values.len() + 1));
+        values.push(Box::new(is_active as i32));
+    }
+
+    if set_clauses.is_empty() {
+        return Ok(false);
+    }
+
+    values.push(Box::new(id));
+    let sql = format!(
+        "UPDATE users SET {} WHERE id = ?{}",
+        set_clauses.join(", "),
+        values.len()
+    );
+
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+    let affected = db_conn.execute(&sql, params_refs.as_slice())?;
+    Ok(affected > 0)
+}
+
+pub fn delete_user(db_conn: &Connection, id: i32) -> Result<bool> {
+    let affected = db_conn.execute(
+        "UPDATE users SET is_active = 0 WHERE id = ?1 AND is_active = 1",
+        params![id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn list_entry_logs(
+    db_conn: &Connection,
+    date: Option<&str>,
+    user_id: Option<i32>,
+    page: i32,
+    page_size: i32,
+) -> Result<(Vec<EntryLogRow>, i64)> {
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(d) = date {
+        where_clauses.push(format!("date(timestamp) = ?{}", params.len() + 1));
+        params.push(Box::new(d.to_string()));
+    }
+    if let Some(uid) = user_id {
+        where_clauses.push(format!("user_id = ?{}", params.len() + 1));
+        params.push(Box::new(uid));
+    }
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_clauses.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM entry_logs {}", where_sql);
+    let count_params: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|v| v.as_ref()).collect();
+    let total: i64 = db_conn.query_row(&count_sql, count_params.as_slice(), |row| row.get(0))?;
+
+    let offset = (page - 1).max(0) * page_size;
+    let query_sql = format!(
+        "SELECT id, user_id, auth_method, success, timestamp \
+         FROM entry_logs {} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
+        where_sql,
+        params.len() + 1,
+        params.len() + 2,
+    );
+    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = params;
+    all_params.push(Box::new(page_size));
+    all_params.push(Box::new(offset));
+
+    let query_params: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|v| v.as_ref()).collect();
+    let mut stmt = db_conn.prepare(&query_sql)?;
+    let rows = stmt.query_map(query_params.as_slice(), |row| {
+        Ok(EntryLogRow {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            auth_method: row.get(2)?,
+            success: row.get::<_, i32>(3)? != 0,
+            timestamp: row.get(4)?,
+        })
+    })?
+    .collect::<rusqlite::Result<Vec<EntryLogRow>>>()?;
+
+    Ok((rows, total))
 }
 
 mod tests {
@@ -240,7 +400,7 @@ mod tests {
     #[test]
     fn test_db() -> Result<()> {
         let _ = std::fs::remove_file("access_control.db");
-        init_db(None)?;
+        let mut connection = init_db(None)?;
         let test_user_info = UserTableInfo {
             name: "Alice".to_string(),
             nfc_uid: "ABC12345".to_string(),
@@ -248,21 +408,21 @@ mod tests {
             department: "IT".to_string(),
             is_active: 1,
         };
-        register_user(test_user_info)?;
+        register_user(&connection, test_user_info)?;
         let mut user_infos = Vec::new();
         for _ in 0..10 {
             user_infos.push(gen_random_user_info());
         }
-        register_users(user_infos)?;
-        let unlock_result = unlock_nfc("ABC12345")?;
+        register_users(&mut connection, user_infos)?;
+        let unlock_result = unlock_nfc(&connection,"ABC12345")?;
         if unlock_result {
             println!("NFC解锁成功");
         } else {
             println!("NFC解锁失败");
         }
-        let temp_code = apply_temp_code(1, Duration::minutes(5))?;
+        let temp_code = apply_temp_code(&connection, 1, Duration::minutes(5))?;
         println!("临时码: {}", temp_code);
-        let temp_code_result = unlock_temp_code(&temp_code)?;
+        let temp_code_result = unlock_temp_code(&connection, &temp_code)?;
         if temp_code_result {
             println!("临时码解锁成功");
         } else {            

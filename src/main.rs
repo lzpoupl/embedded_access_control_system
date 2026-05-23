@@ -1,51 +1,86 @@
-use std::env;
-use std::fs::File;
-use std::io::{self, Read};
-use libc::input_event;
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
+mod auth;
+mod config;
 mod db;
+mod error;
+mod keyboard;
+mod motor;
+mod nfc;
+mod web;
 
-const EV_KEY: u16 = 0x01; // 手动定义 EV_KEY
+#[tokio::main]
+async fn main() {
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_string());
 
-fn main() -> io::Result<()> {
-    // 获取命令行参数
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <input_device>", args[0]);
-        eprintln!("Example: {} /dev/input/event0", args[0]);
-        std::process::exit(1);
-    }
+    let config = config::load_config(&config_path).expect("加载配置文件失败");
 
-    let device_path = &args[1];
+    let db_conn = Arc::new(Mutex::new(
+        db::init_db(Some(&config.database.path)).expect("数据库初始化失败"),
+    ));
 
-    // 打开输入设备文件
-    let mut file = File::open(device_path)?;
-    println!("Listening for key events on {}...", device_path);
+    let motor = Arc::new(motor::Motor::new().expect("电机初始化失败"));
 
-    // 读取输入事件
-    let mut event: input_event = unsafe { std::mem::zeroed() };
-    let event_size = std::mem::size_of::<input_event>();
+    let (key_tx, key_rx) = mpsc::channel::<char>();
+    let (nfc_tx, nfc_rx) = mpsc::channel::<String>();
+    let (auth_tx, auth_rx) = mpsc::channel::<auth::AuthEvent>();
 
-    loop {
-        // 读取事件
-        let bytes_read = file.read(unsafe {
-            std::slice::from_raw_parts_mut(
-                &mut event as *mut _ as *mut u8,
-                event_size,
-            )
-        })?;
-
-        if bytes_read != event_size {
-            eprintln!("Failed to read complete event");
-            continue;
-        }
-
-        // 处理按键事件
-        if event.type_ == EV_KEY {
-            if event.value == 0 || event.value == 1 {
-                let key_state = if event.value == 1 { "Pressed" } else { "Released" };
-                println!("key {} {}", event.code, key_state);
+    let auth_tx_key = auth_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(c) = key_rx.recv() {
+            if auth_tx_key.send(auth::AuthEvent::KeyChar(c)).is_err() {
+                break;
             }
         }
-    }
+    });
+
+    std::thread::spawn(move || {
+        while let Ok(uid) = nfc_rx.recv() {
+            if auth_tx.send(auth::AuthEvent::NfcUid(uid)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let web_state = web::WebState {
+        config_path: config_path.clone(),
+        config: Arc::new(RwLock::new(config.clone())),
+        db_conn: db_conn.clone(),
+    };
+
+    let key_dev = config.devices.keyboard_input.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut kb =
+            keyboard::Keyboard::new(&key_dev, key_tx).expect("键盘设备打开失败");
+        if let Err(e) = kb.run() {
+            eprintln!("键盘错误: {}", e);
+        }
+    });
+
+    let nfc_dev = config.devices.nfc_uart.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut reader =
+            nfc::NfcReader::new(&nfc_dev, nfc_tx).expect("NFC 设备打开失败");
+        if let Err(e) = reader.run() {
+            eprintln!("NFC 错误: {}", e);
+        }
+    });
+
+    let lock_ms = config.access.lock_open_ms;
+    tokio::task::spawn_blocking(move || {
+        let mut auth_svc = auth::Auth::new(auth_rx, motor, lock_ms);
+        auth_svc.run();
+    });
+
+    let web_handle = tokio::spawn(async {
+        if let Err(e) = web::run_server(web_state).await {
+            eprintln!("Web 服务器错误: {:?}", e);
+        }
+    });
+
+    tokio::signal::ctrl_c().await.ok();
+    println!("正在关闭…");
+    web_handle.abort();
 }
